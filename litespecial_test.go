@@ -46,6 +46,7 @@ func TestTableNilReceiver_LiteTable(t *testing.T) {
 		mustPanic(t, "Clone", func() { tbl1.Clone() })
 		mustPanic(t, "Union", func() { tbl1.Union(nil) })
 		mustPanic(t, "UnionPersist", func() { tbl1.UnionPersist(nil) })
+		mustPanic(t, "DifferencePersist", func() { tbl1.DifferencePersist(nil) })
 		mustPanic(t, "Overlaps", func() { tbl1.Overlaps(nil) })
 		mustPanic(t, "Overlaps4", func() { tbl1.Overlaps4(nil) })
 		mustPanic(t, "Overlaps6", func() { tbl1.Overlaps6(nil) })
@@ -113,6 +114,76 @@ func TestTableInvalid_LiteTable(t *testing.T) {
 	noPanic(t, "Supernets", func() { tbl1.Supernets(zeroPfx) })
 	noPanic(t, "Union", func() { tbl1.Union(tbl2) })
 	noPanic(t, "UnionPersist", func() { tbl1.UnionPersist(tbl2) })
+	noPanic(t, "DifferencePersist", func() { tbl1.DifferencePersist(tbl2) })
+}
+
+func TestLiteDifferencePersist(t *testing.T) {
+	t.Parallel()
+
+	n := workLoadN()
+	prng := rand.New(rand.NewPCG(42, 42))
+	pfxs := random.RealWorldPrefixes(prng, n)
+
+	lite := new(Lite)
+	for _, pfx := range pfxs {
+		lite.Insert(pfx)
+	}
+
+	tests := []struct {
+		name string
+		del  []netip.Prefix
+		same bool // the receiver is returned
+	}{
+		{name: "empty", same: true},
+		{name: "not in table", del: []netip.Prefix{mpp("0.0.0.0/0"), mpp("::/0")}, same: true},
+		{name: "half", del: pfxs[:n/2]},
+		{name: "all", del: pfxs},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			o := new(Lite)
+			for _, pfx := range tt.del {
+				o.Insert(pfx)
+			}
+
+			got := lite.DifferencePersist(o)
+			if (got == lite) != tt.same {
+				t.Fatalf("got the receiver: %v, want %v", got == lite, tt.same)
+			}
+
+			if lite.Size() != n {
+				t.Fatal("DifferencePersist changed the receiver")
+			}
+
+			// one DeletePersist per prefix
+			want := lite
+			for _, pfx := range tt.del {
+				want = want.DeletePersist(pfx)
+			}
+
+			if !got.Equal(want) || got.dumpString() != want.dumpString() {
+				t.Fatalf("got: %s\nwant: %s", got.dumpString(), want.dumpString())
+			}
+
+			for _, pfx := range tt.del {
+				if got.Get(pfx) {
+					t.Fatalf("Get(%s), got true, want false", pfx)
+				}
+			}
+		})
+	}
+
+	if got := lite.DifferencePersist(lite); got == lite || got.Size() != 0 || lite.Size() != n {
+		t.Fatal("DifferencePersist(self) must return a new empty table and keep the receiver")
+	}
+
+	empty := new(Lite)
+	if got := empty.DifferencePersist(empty); got == empty || got.Size() != 0 {
+		t.Fatal("DifferencePersist(self) must return a new empty table, also if empty")
+	}
 }
 
 func TestLiteIteratorsEarlyExit(t *testing.T) {

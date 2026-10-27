@@ -786,6 +786,76 @@ func (t *Table[V]) UnionPersist(o *Table[V]) *Table[V] {
 	return pt
 }
 
+// DifferencePersist returns a new *Table with the prefixes of t that are
+// not in o. The receiver isn't modified and the values in o are ignored.
+//
+// It is the reverse of [Table.UnionPersist]. Each node that changes is
+// cloned only once, so one call with many prefixes in o costs much less than
+// one DeletePersist call per prefix. All untouched nodes are still referenced
+// from both tables.
+//
+// If o is empty or holds no prefix of t, the receiver is returned unchanged.
+// If o is t, a new empty table is returned, also for an empty t.
+//
+// If the payload type V contains pointers or requires deep copying,
+// it must implement the Clone method for correct cloning.
+//
+// It writes only to new nodes, never to t or o. As with the other persist
+// methods, readers can use t without a lock during the call, and writers
+// must be serialized, see the concurrency examples. o must not change
+// during the call.
+func (t *Table[V]) DifferencePersist(o *Table[V]) *Table[V] {
+	// panics on nil receiver
+	_ = t.size4
+
+	// before the test for empty o, also an empty t gets a new table
+	if o == t {
+		return new(Table[V])
+	}
+
+	// panics on nil argument
+	if o.size4 == 0 && o.size6 == 0 {
+		return t
+	}
+
+	// Create a cloning function for deep copying values;
+	// returns nil if V does not provide a Clone() V method.
+	cloneFn := value.CloneFnFactory[V]()
+
+	// new Table with root nodes just copied.
+	pt := &Table[V]{
+		root4: t.root4,
+		root6: t.root6,
+		//
+		size4: t.size4,
+		size6: t.size6,
+	}
+
+	// only clone the root node if there is something to remove,
+	// and keep the clone only if a prefix was removed
+	if t.size4 != 0 && o.size4 != 0 {
+		root4 := t.root4.CloneFlat(cloneFn)
+		if del4 := root4.DifferenceRecPersist(cloneFn, &o.root4, stridePath{}, 0, true); del4 != 0 {
+			pt.root4 = *root4
+			pt.size4 -= del4
+		}
+	}
+	if t.size6 != 0 && o.size6 != 0 {
+		root6 := t.root6.CloneFlat(cloneFn)
+		if del6 := root6.DifferenceRecPersist(cloneFn, &o.root6, stridePath{}, 0, false); del6 != 0 {
+			pt.root6 = *root6
+			pt.size6 -= del6
+		}
+	}
+
+	// no prefix of o was in t
+	if pt.size4 == t.size4 && pt.size6 == t.size6 {
+		return t
+	}
+
+	return pt
+}
+
 // Equal checks whether two tables are structurally and semantically equal.
 // It ensures both trees (IPv4-based and IPv6-based) have the same sizes and
 // recursively compares their root nodes.

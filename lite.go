@@ -229,6 +229,27 @@ func (l *Lite) UnionPersist(o *Lite) *Lite {
 	return &Lite{*lp}
 }
 
+// DifferencePersist returns a new *Lite with the prefixes of l that are not in o.
+// The receiver isn't modified.
+//
+// It is the reverse of [Lite.UnionPersist]. Each node that changes is cloned
+// only once, so one call with many prefixes in o costs much less than one
+// [Lite.DeletePersist] call per prefix.
+//
+// If o is empty or holds no prefix of l, the receiver is returned unchanged.
+// If o is l, a new empty table is returned, also for an empty l.
+//
+// It writes only to new nodes, never to l or o. As with the other persist
+// methods, readers can use l without a lock during the call.
+func (l *Lite) DifferencePersist(o *Lite) *Lite {
+	lp := l.liteTable.DifferencePersist(&o.liteTable)
+	if lp == &l.liteTable {
+		return l
+	}
+	//nolint:govet // copy of *lp is here by intention
+	return &Lite{*lp}
+}
+
 // All returns an iterator over all prefixes in the table.
 //
 // The iteration order is unspecified and may vary between calls; for a stable order,

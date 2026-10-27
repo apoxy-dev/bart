@@ -78,6 +78,10 @@ func (n *_NODE_TYPE[V]) AllRecSorted(stridePath, int, bool, func(netip.Prefix, V
 	return
 }
 
+func (n *_NODE_TYPE[V]) DifferenceRecPersist(func(V) V, *_NODE_TYPE[V], stridePath, int, bool) (_ int) {
+	return
+}
+
 // ### GENERATE DELETE END ###
 
 // rootNodeByVersion, root node getter for ip version.
@@ -841,6 +845,76 @@ func (t *_TABLE_TYPE[V]) UnionPersist(o *_TABLE_TYPE[V]) *_TABLE_TYPE[V] {
 
 	pt.size4 += o.size4 - dup4
 	pt.size6 += o.size6 - dup6
+
+	return pt
+}
+
+// DifferencePersist returns a new *_TABLE_TYPE with the prefixes of t that are
+// not in o. The receiver isn't modified and the values in o are ignored.
+//
+// It is the reverse of [_TABLE_TYPE.UnionPersist]. Each node that changes is
+// cloned only once, so one call with many prefixes in o costs much less than
+// one DeletePersist call per prefix. All untouched nodes are still referenced
+// from both tables.
+//
+// If o is empty or holds no prefix of t, the receiver is returned unchanged.
+// If o is t, a new empty table is returned, also for an empty t.
+//
+// If the payload type V contains pointers or requires deep copying,
+// it must implement the Clone method for correct cloning.
+//
+// It writes only to new nodes, never to t or o. As with the other persist
+// methods, readers can use t without a lock during the call, and writers
+// must be serialized, see the concurrency examples. o must not change
+// during the call.
+func (t *_TABLE_TYPE[V]) DifferencePersist(o *_TABLE_TYPE[V]) *_TABLE_TYPE[V] {
+	// panics on nil receiver
+	_ = t.size4
+
+	// before the test for empty o, also an empty t gets a new table
+	if o == t {
+		return new(_TABLE_TYPE[V])
+	}
+
+	// panics on nil argument
+	if o.size4 == 0 && o.size6 == 0 {
+		return t
+	}
+
+	// Create a cloning function for deep copying values;
+	// returns nil if V does not provide a Clone() V method.
+	cloneFn := value.CloneFnFactory[V]()
+
+	// new _TABLE_TYPE with root nodes just copied.
+	pt := &_TABLE_TYPE[V]{
+		root4: t.root4,
+		root6: t.root6,
+		//
+		size4: t.size4,
+		size6: t.size6,
+	}
+
+	// only clone the root node if there is something to remove,
+	// and keep the clone only if a prefix was removed
+	if t.size4 != 0 && o.size4 != 0 {
+		root4 := t.root4.CloneFlat(cloneFn)
+		if del4 := root4.DifferenceRecPersist(cloneFn, &o.root4, stridePath{}, 0, true); del4 != 0 {
+			pt.root4 = *root4
+			pt.size4 -= del4
+		}
+	}
+	if t.size6 != 0 && o.size6 != 0 {
+		root6 := t.root6.CloneFlat(cloneFn)
+		if del6 := root6.DifferenceRecPersist(cloneFn, &o.root6, stridePath{}, 0, false); del6 != 0 {
+			pt.root6 = *root6
+			pt.size6 -= del6
+		}
+	}
+
+	// no prefix of o was in t
+	if pt.size4 == t.size4 && pt.size6 == t.size6 {
+		return t
+	}
 
 	return pt
 }

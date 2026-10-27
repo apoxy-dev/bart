@@ -1052,3 +1052,46 @@ func aggregate(s *[]netip.Prefix) {
 		}
 	}
 }
+
+func BenchmarkTableDifferencePersist(b *testing.B) {
+	const n = 100_000
+
+	prng := rand.New(rand.NewPCG(42, 42))
+
+	set := make(map[netip.Prefix]bool, n)
+	pfxs := make([]netip.Prefix, 0, n)
+	for len(pfxs) < n {
+		pfx := netip.PrefixFrom(random.IP4(prng), 32)
+		if !set[pfx] {
+			set[pfx] = true
+			pfxs = append(pfxs, pfx)
+		}
+	}
+
+	tbl := new(Table[int])
+	for i, pfx := range pfxs {
+		tbl.Insert(pfx, i)
+	}
+
+	for _, k := range []int{1, 1_000, 100_000} {
+		o := new(Table[int])
+		for _, pfx := range pfxs[:k] {
+			o.Insert(pfx, 0)
+		}
+
+		b.Run(fmt.Sprintf("DeletePersist/%d", k), func(b *testing.B) {
+			for b.Loop() {
+				next := tbl
+				for _, pfx := range pfxs[:k] {
+					next = next.DeletePersist(pfx)
+				}
+			}
+		})
+
+		b.Run(fmt.Sprintf("DifferencePersist/%d", k), func(b *testing.B) {
+			for b.Loop() {
+				tbl.DifferencePersist(o)
+			}
+		})
+	}
+}

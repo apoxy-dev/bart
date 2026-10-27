@@ -20,6 +20,8 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gaissmai/bart/internal/nodes"
@@ -85,6 +87,8 @@ func (*_TABLE_TYPE[V]) AllSorted6() (_ iter.Seq2[netip.Prefix, V]) { return }
 func (*_TABLE_TYPE[V]) Subnets(netip.Prefix) (_ iter.Seq2[netip.Prefix, V])   { return }
 func (*_TABLE_TYPE[V]) Supernets(netip.Prefix) (_ iter.Seq2[netip.Prefix, V]) { return }
 
+func (*_TABLE_TYPE[V]) DifferencePersist(*_TABLE_TYPE[V]) (_ *_TABLE_TYPE[V]) { return }
+
 // ### GENERATE DELETE END ###
 
 // ############ tests ################################
@@ -136,6 +140,7 @@ func TestTableNilReceiver__TABLE_TYPE(t *testing.T) {
 		mustPanic(t, "Clone", func() { tbl1.Clone() })
 		mustPanic(t, "Union", func() { tbl1.Union(tbl2) })
 		mustPanic(t, "UnionPersist", func() { tbl1.UnionPersist(tbl2) })
+		mustPanic(t, "DifferencePersist", func() { tbl1.DifferencePersist(tbl2) })
 		mustPanic(t, "Overlaps", func() { tbl1.Overlaps(tbl2) })
 		mustPanic(t, "Overlaps4", func() { tbl1.Overlaps4(tbl2) })
 		mustPanic(t, "Overlaps6", func() { tbl1.Overlaps6(tbl2) })
@@ -171,6 +176,7 @@ func TestTableNilArguments__TABLE_TYPE(t *testing.T) {
 
 		mustPanic(t, "Union(nil)", func() { tbl.Union(nil) })
 		mustPanic(t, "UnionPersist(nil)", func() { tbl.UnionPersist(nil) })
+		mustPanic(t, "DifferencePersist(nil)", func() { tbl.DifferencePersist(nil) })
 		mustPanic(t, "Overlaps(nil)", func() { tbl.Overlaps(nil) })
 		mustPanic(t, "Overlaps4(nil)", func() { tbl.Overlaps4(nil) })
 		mustPanic(t, "Overlaps6(nil)", func() { tbl.Overlaps6(nil) })
@@ -222,6 +228,7 @@ func TestTableInvalid__TABLE_TYPE(t *testing.T) {
 	noPanic(t, "Supernets", func() { tbl1.Supernets(zeroPfx) })
 	noPanic(t, "Union", func() { tbl1.Union(tbl2) })
 	noPanic(t, "UnionPersist", func() { tbl1.UnionPersist(tbl2) })
+	noPanic(t, "DifferencePersist", func() { tbl1.DifferencePersist(tbl2) })
 }
 
 func TestTableContainsCompare__TABLE_TYPE(t *testing.T) {
@@ -1442,6 +1449,545 @@ func TestTableUnionPersistCompare__TABLE_TYPE(t *testing.T) {
 				t.Fatal("expected Equal")
 			}
 		}
+	}
+}
+
+func TestTableDifferencePersistCompare__TABLE_TYPE(t *testing.T) {
+	// Delete a batch of prefixes with DifferencePersist and compare the
+	// result with one DeletePersist per prefix and with the golden table.
+	t.Parallel()
+
+	n := workLoadN()
+
+	tests := []struct {
+		name  string
+		hosts bool // only host routes, the trie gets deep nodes and many fringes
+		del   int  // number of table prefixes in o
+		miss  int  // number of prefixes in o that are not in the table
+	}{
+		{name: "empty o"},
+		{name: "only missing", miss: n / 10},
+		{name: "one", del: 1},
+		{name: "few", del: n / 100, miss: n / 100},
+		{name: "half", del: n / 2, miss: n / 10},
+		{name: "most", del: n - n/100},
+		{name: "all", del: n},
+		{name: "all and missing", del: n, miss: n / 10},
+		{name: "hosts, half", hosts: true, del: n / 2, miss: n / 10},
+		{name: "hosts, all", hosts: true, del: n},
+	}
+
+	for ti, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			prng := rand.New(rand.NewPCG(42, uint64(ti)))
+
+			pfxs := random.RealWorldPrefixes(prng, n)
+			if tt.hosts {
+				pfxs = randomHostRoutes(prng, n)
+			}
+
+			gold := new(golden.Table[int])
+			tbl := new(_TABLE_TYPE[int])
+
+			for i, pfx := range pfxs {
+				gold.Insert(pfx, i)
+				tbl.Insert(pfx, i)
+			}
+
+			// o holds the first del prefixes of pfxs ...
+			o := new(_TABLE_TYPE[int])
+			for _, pfx := range pfxs[:tt.del] {
+				o.Insert(pfx, -1)
+			}
+
+			// ... and misses on the paths of the table prefixes
+			for o.Size() < tt.del+tt.miss {
+				addr := pfxs[prng.IntN(n)].Addr()
+				miss := netip.PrefixFrom(addr, prng.IntN(addr.BitLen()+1)).Masked()
+				if _, ok := tbl.Get(miss); !ok {
+					o.Insert(miss, -1)
+				}
+			}
+
+			tblDump := tbl.dumpString()
+			oDump := o.dumpString()
+
+			got := tbl.DifferencePersist(o)
+
+			if tbl.Size() != n || tbl.dumpString() != tblDump {
+				t.Fatal("DifferencePersist changed the receiver")
+			}
+			if o.dumpString() != oDump {
+				t.Fatal("DifferencePersist changed the argument")
+			}
+
+			// one DeletePersist per prefix
+			seq := tbl
+			for pfx := range o.All() {
+				seq = seq.DeletePersist(pfx)
+				gold.Delete(pfx)
+			}
+
+			if got.Size() != n-tt.del || got.Size4() != seq.Size4() || got.Size6() != seq.Size6() {
+				t.Fatalf("Size(), got %d, want %d", got.Size(), n-tt.del)
+			}
+
+			if !got.Equal(seq) {
+				t.Fatal("expected Equal to DeletePersist")
+			}
+
+			// the same trie after path compression
+			if got.dumpString() != seq.dumpString() {
+				t.Fatalf("trie differs from DeletePersist\n got: %s\nwant: %s", got.dumpString(), seq.dumpString())
+			}
+
+			_, isLite := any(tbl).(*liteTable[int])
+
+			for i, pfx := range pfxs {
+				val, ok := got.Get(pfx)
+				if want := i >= tt.del; ok != want {
+					t.Fatalf("Get(%s), got %v, want %v", pfx, ok, want)
+				}
+				if ok && !isLite && val != i {
+					t.Fatalf("Get(%s), got value %d, want %d", pfx, val, i)
+				}
+			}
+
+			count := 0
+			for range got.All() {
+				count++
+			}
+			if count != got.Size() {
+				t.Fatalf("All(), got %d items, want %d", count, got.Size())
+			}
+
+			gold.Sort()
+			flat := got.flatSorted()
+
+			// Skip value comparison for liteTable (no real payload)
+			if isLite {
+				if !slices.Equal(gold.AllSorted(), flat.AllSorted()) {
+					t.Fatal("expected Equal to golden table")
+				}
+			} else {
+				if !slices.Equal(*gold, flat) {
+					t.Fatal("expected Equal to golden table")
+				}
+			}
+
+			for range n {
+				// hits and misses on the paths of all prefixes, and random addrs
+				ip := pfxs[prng.IntN(n)].Addr()
+				if prng.IntN(2) == 0 {
+					ip = random.IP(prng)
+				}
+
+				goldVal, goldOK := gold.Lookup(ip)
+				val, ok := got.Lookup(ip)
+				if ok != goldOK || (!isLite && val != goldVal) {
+					t.Fatalf("Lookup(%s), got (%v, %v), want (%v, %v)", ip, val, ok, goldVal, goldOK)
+				}
+
+				pfx := netip.PrefixFrom(ip, prng.IntN(ip.BitLen()+1)).Masked()
+				goldLPM, _, goldOK := gold.LookupPrefixLPM(pfx)
+				lpm, _, ok := got.LookupPrefixLPM(pfx)
+				if ok != goldOK || lpm != goldLPM {
+					t.Fatalf("LookupPrefixLPM(%s), got (%s, %v), want (%s, %v)", pfx, lpm, ok, goldLPM, goldOK)
+				}
+			}
+		})
+	}
+}
+
+func TestTableDifferencePersistShape__TABLE_TYPE(t *testing.T) {
+	// After a batch delete, path compression must give the same trie as
+	// Delete for each prefix. The first cases are the example of bart issue #247.
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		pfxs []string
+		del  []string
+	}{
+		{
+			name: "issue 247, delete /18",
+			pfxs: []string{"4.0.0.0/7", "89.103.192.0/18", "89.103.192.0/24"},
+			del:  []string{"89.103.192.0/18"},
+		},
+		{
+			name: "issue 247, delete /24",
+			pfxs: []string{"4.0.0.0/7", "89.103.192.0/18", "89.103.192.0/24"},
+			del:  []string{"89.103.192.0/24"},
+		},
+		{
+			name: "issue 247, delete /7 and /18",
+			pfxs: []string{"4.0.0.0/7", "89.103.192.0/18", "89.103.192.0/24"},
+			del:  []string{"4.0.0.0/7", "89.103.192.0/18"},
+		},
+		{
+			name: "nodes get empty",
+			pfxs: []string{"10.1.2.0/24", "10.1.3.0/24", "10.1.4.0/24", "192.0.2.0/24"},
+			del:  []string{"10.1.2.0/24", "10.1.3.0/24", "10.1.4.0/24"},
+		},
+		{
+			name: "one fringe stays",
+			pfxs: []string{"10.1.2.0/24", "10.1.3.0/24", "10.1.4.0/24", "192.0.2.0/24"},
+			del:  []string{"10.1.2.0/24", "10.1.3.0/24"},
+		},
+		{
+			name: "path nodes stay",
+			pfxs: []string{"10.1.2.3/32", "10.1.2.4/32", "10.1.0.0/16", "10.2.0.0/16"},
+			del:  []string{"10.1.0.0/16", "10.2.0.0/16"},
+		},
+		{
+			name: "leaf of o deep in node",
+			pfxs: []string{"10.1.2.0/25", "10.1.2.128/25", "10.1.3.0/24", "10.9.0.0/16"},
+			del:  []string{"10.1.2.0/25", "11.0.0.0/8"},
+		},
+		{
+			name: "fringe of o is default route of node",
+			pfxs: []string{"10.1.0.0/16", "10.1.2.0/24", "10.1.3.0/24", "10.3.0.0/16"},
+			del:  []string{"10.1.0.0/16", "10.2.0.0/16"},
+		},
+		{
+			name: "leaf in node of o",
+			pfxs: []string{"10.1.2.0/25", "10.9.0.0/16"},
+			del:  []string{"10.1.2.0/25", "10.1.3.0/24"},
+		},
+		{
+			name: "fringe in node of o",
+			pfxs: []string{"10.1.0.0/16", "10.9.0.0/16"},
+			del:  []string{"10.1.0.0/16", "10.1.2.0/24"},
+		},
+		{
+			name: "different leaves, same fringes",
+			pfxs: []string{"10.1.2.0/25", "10.9.0.0/16"},
+			del:  []string{"10.1.2.128/25", "10.9.0.0/16"},
+		},
+		{
+			name: "fringe and leaf at same addr",
+			pfxs: []string{"2001:db8::/32", "2001:db9::/32"},
+			del:  []string{"2001:db8:8000::/33", "2001:d00::/32"},
+		},
+		{
+			name: "leaf and fringe at same addr",
+			pfxs: []string{"2001:db8:8000::/33", "2001:d00::/32"},
+			del:  []string{"2001:db8::/32", "2001:db9::/32"},
+		},
+		{
+			name: "default routes",
+			pfxs: []string{"0.0.0.0/0", "10.0.0.0/8", "::/0", "2001:db8::/32"},
+			del:  []string{"0.0.0.0/0", "::/0"},
+		},
+		{
+			name: "host routes",
+			pfxs: []string{"10.0.0.1/32", "10.0.0.2/32", "10.0.0.3/32", "::1/128", "::2/128"},
+			del:  []string{"10.0.0.1/32", "10.0.0.2/32", "::1/128"},
+		},
+		{
+			name: "ipv6 mixed",
+			pfxs: []string{"::/0", "2001:db8::/32", "2001:db8::/48", "2001:db8:1::/48", "2001:db8::1/128"},
+			del:  []string{"::/0", "2001:db8::/32", "2001:db8::1/128"},
+		},
+		{
+			name: "nothing to delete",
+			pfxs: []string{"10.1.2.0/24", "10.1.3.0/24", "2001:db8::/32"},
+			del:  []string{"10.1.5.0/24", "11.0.0.0/8", "2001:db8::/33"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tbl := new(_TABLE_TYPE[int])
+			for i, s := range tt.pfxs {
+				tbl.Insert(mpp(s), i)
+			}
+
+			o := new(_TABLE_TYPE[int])
+			want := tbl.Clone()
+			for _, s := range tt.del {
+				o.Insert(mpp(s), -1)
+				want.Delete(mpp(s))
+			}
+
+			tblDump := tbl.dumpString()
+
+			got := tbl.DifferencePersist(o)
+
+			if tbl.dumpString() != tblDump {
+				t.Fatal("DifferencePersist changed the receiver")
+			}
+
+			if got.Size() != want.Size() || !got.Equal(want) {
+				t.Fatalf("Size(), got %d, want %d", got.Size(), want.Size())
+			}
+
+			if got.dumpString() != want.dumpString() {
+				t.Fatalf("trie differs from Delete\n got: %s\nwant: %s", got.dumpString(), want.dumpString())
+			}
+		})
+	}
+}
+
+func TestTableDifferencePersistSpecial__TABLE_TYPE(t *testing.T) {
+	t.Parallel()
+
+	newTable := func(pfx ...string) *_TABLE_TYPE[int] {
+		tbl := new(_TABLE_TYPE[int])
+		for _, s := range pfx {
+			tbl.Insert(mpp(s), 0)
+		}
+		return tbl
+	}
+
+	pfxs := []string{
+		"0.0.0.0/0", "10.0.0.0/8", "10.1.0.0/16", "10.1.2.3/32", "192.168.1.0/24", "192.168.2.0/24",
+		"::/0", "2001:db8::/32", "2001:db8::1/128",
+	}
+	// extra does not touch the 192.168.0.0/16 node
+	extra := []string{"10.1.2.4/32", "10.2.0.0/16", "2001:db8::2/128"}
+
+	tests := []struct {
+		name   string
+		tables func() (tbl, o *_TABLE_TYPE[int])
+		same   bool     // the receiver is returned
+		want   []string // the prefixes of the result
+	}{
+		{
+			name:   "empty o",
+			tables: func() (_, _ *_TABLE_TYPE[int]) { return newTable(pfxs...), newTable() },
+			same:   true,
+			want:   pfxs,
+		},
+		{
+			name:   "empty receiver",
+			tables: func() (_, _ *_TABLE_TYPE[int]) { return newTable(), newTable(pfxs...) },
+			same:   true,
+		},
+		{
+			name:   "no prefix in common",
+			tables: func() (_, _ *_TABLE_TYPE[int]) { return newTable(pfxs...), newTable(extra...) },
+			same:   true,
+			want:   pfxs,
+		},
+		{
+			name:   "ipv4 only",
+			tables: func() (_, _ *_TABLE_TYPE[int]) { return newTable(pfxs...), newTable("10.0.0.0/8", "10.1.2.3/32") },
+			want: []string{
+				"0.0.0.0/0", "10.1.0.0/16", "192.168.1.0/24", "192.168.2.0/24",
+				"::/0", "2001:db8::/32", "2001:db8::1/128",
+			},
+		},
+		{
+			name:   "ipv6 only",
+			tables: func() (_, _ *_TABLE_TYPE[int]) { return newTable(pfxs...), newTable("::/0", "2001:db8::1/128") },
+			want: []string{
+				"0.0.0.0/0", "10.0.0.0/8", "10.1.0.0/16", "10.1.2.3/32", "192.168.1.0/24", "192.168.2.0/24",
+				"2001:db8::/32",
+			},
+		},
+		{
+			name: "o is the receiver",
+			tables: func() (_, _ *_TABLE_TYPE[int]) {
+				tbl := newTable(pfxs...)
+				return tbl, tbl
+			},
+		},
+		{
+			name: "o is the empty receiver",
+			tables: func() (_, _ *_TABLE_TYPE[int]) {
+				tbl := newTable()
+				return tbl, tbl
+			},
+		},
+		{
+			name: "o is a clone",
+			tables: func() (_, _ *_TABLE_TYPE[int]) {
+				tbl := newTable(pfxs...)
+				return tbl, tbl.Clone()
+			},
+		},
+		{
+			name: "o shares nodes with the receiver",
+			tables: func() (_, _ *_TABLE_TYPE[int]) {
+				base := newTable(pfxs...)
+				tbl := base
+				for _, s := range extra {
+					tbl = tbl.InsertPersist(mpp(s), 0)
+				}
+				return tbl, base
+			},
+			want: extra,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tbl, o := tt.tables()
+			tblDump := tbl.dumpString()
+			oDump := o.dumpString()
+
+			got := tbl.DifferencePersist(o)
+
+			if (got == tbl) != tt.same {
+				t.Fatalf("got the receiver: %v, want %v", got == tbl, tt.same)
+			}
+
+			if tbl.dumpString() != tblDump || o.dumpString() != oDump {
+				t.Fatal("DifferencePersist changed the receiver or the argument")
+			}
+
+			want := newTable(tt.want...)
+			if !got.Equal(want) || got.dumpString() != want.dumpString() {
+				t.Fatalf("got: %s\nwant: %s", got.dumpString(), want.dumpString())
+			}
+		})
+	}
+}
+
+func TestTableDifferencePersistDeep__TABLE_TYPE(t *testing.T) {
+	t.Parallel()
+
+	tbl := new(_TABLE_TYPE[*MyInt])
+	o := new(_TABLE_TYPE[*MyInt])
+
+	if _, isLite := any(tbl).(*liteTable[*MyInt]); isLite {
+		t.Skip("liteNode has no real payload")
+	}
+
+	// All kept prefixes are on cloned paths: in the root, in a root leaf,
+	// and two that move up to the root as leaves after the delete.
+	keep := []string{"0.0.0.0/0", "10.1.4.0/24", "172.16.0.0/12", "::/0", "2001:db8::2/128"}
+	del := []string{"10.1.2.0/24", "10.1.3.0/24", "2001:db8::1/128"}
+
+	for i, s := range keep {
+		val := MyInt(i)
+		tbl.Insert(mpp(s), &val)
+	}
+	for _, s := range del {
+		val := MyInt(-1)
+		tbl.Insert(mpp(s), &val)
+		o.Insert(mpp(s), &val)
+	}
+
+	got := tbl.DifferencePersist(o)
+
+	for i, s := range keep {
+		gotVal, _ := got.Get(mpp(s))
+		wantVal, _ := tbl.Get(mpp(s))
+
+		if *gotVal != *wantVal || gotVal == wantVal {
+			t.Errorf("%s: value with Cloner interface, pointers must be different:\nvalues(%d, %d)\n(ptr(%v, %v)",
+				s, *gotVal, *wantVal, gotVal, wantVal)
+		}
+
+		// update the new value, the old value must not change
+		*gotVal += 100
+		if *wantVal != MyInt(i) {
+			t.Errorf("%s: memory aliasing after deep copy, value of receiver changed to %d", s, *wantVal)
+		}
+	}
+}
+
+func TestTableDifferencePersistConcurrent__TABLE_TYPE(t *testing.T) {
+	// Readers use the current table with no lock while a writer swaps it
+	// between the full table and the table without half of the prefixes.
+	// Run it with -race: a write to a node that a reader can see is a data race.
+	t.Parallel()
+
+	n := workLoadN()
+	prng := rand.New(rand.NewPCG(42, 42))
+	pfxs := random.RealWorldPrefixes(prng, n)
+
+	full := new(_TABLE_TYPE[int])
+	for i, pfx := range pfxs {
+		full.Insert(pfx, i)
+	}
+
+	// del and add are private tables of the writer
+	del := new(_TABLE_TYPE[int])
+	add := new(_TABLE_TYPE[int])
+	for i, pfx := range pfxs[:n/2] {
+		del.Insert(pfx, -1)
+		add.Insert(pfx, i)
+	}
+
+	half := full.DifferencePersist(del)
+
+	var current atomic.Pointer[_TABLE_TYPE[int]]
+	current.Store(full)
+
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+
+	defer func() {
+		stop.Store(true)
+		wg.Wait()
+	}()
+
+	for r := range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rp := rand.New(rand.NewPCG(42, uint64(r)))
+
+			for !stop.Load() {
+				tbl := current.Load()
+
+				want := half
+				if tbl.Size() == full.Size() {
+					want = full
+				} else if tbl.Size() != half.Size() {
+					t.Errorf("reader got Size() %d, want %d or %d", tbl.Size(), full.Size(), half.Size())
+					return
+				}
+
+				for range 10 {
+					pfx := pfxs[rp.IntN(n)]
+					_, ok := tbl.Get(pfx)
+					if _, wantOK := want.Get(pfx); ok != wantOK {
+						t.Errorf("reader Get(%s), got %v, want %v", pfx, ok, wantOK)
+						return
+					}
+
+					ip := random.IP(rp)
+					val, ok := tbl.Lookup(ip)
+					wantVal, wantOK := want.Lookup(ip)
+					if val != wantVal || ok != wantOK {
+						t.Errorf("reader Lookup(%s), got (%v, %v), want (%v, %v)", ip, val, ok, wantVal, wantOK)
+						return
+					}
+				}
+
+				count := 0
+				for range tbl.All() {
+					count++
+				}
+				if count != tbl.Size() {
+					t.Errorf("reader All(), got %d items, want %d", count, tbl.Size())
+					return
+				}
+			}
+		}()
+	}
+
+	for i := range 100 {
+		next := current.Load()
+		if i%2 == 0 {
+			next = next.DifferencePersist(del)
+		} else {
+			next = next.UnionPersist(add)
+		}
+		current.Store(next)
+	}
+
+	if !current.Load().Equal(full) {
+		t.Fatal("expected Equal to the full table after the last swap")
 	}
 }
 

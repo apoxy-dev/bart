@@ -222,6 +222,7 @@ func (t *Table[V]) ModifyPersist(netip.Prefix, cb func(V, bool) (V, bool)) *Tabl
 func (t *Table[V]) Clone() *Table[V]
 func (t *Table[V]) Union(o *Table[V])
 func (t *Table[V]) UnionPersist(o *Table[V]) *Table[V]
+func (t *Table[V]) DifferencePersist(o *Table[V]) *Table[V]
 
 func (t *Table[V]) OverlapsPrefix(netip.Prefix) bool
 

@@ -6,6 +6,7 @@ package bart
 import (
 	"fmt"
 	"iter"
+	"math/rand/v2"
 	"net/netip"
 	"testing"
 )
@@ -120,4 +121,28 @@ func mustPanicRangeOverFunc[V any](t *testing.T, name string, fn any) {
 	default:
 		t.Fatalf("%s unknown iter function: %T", name, iterFunc)
 	}
+}
+
+// randomHostRoutes returns n distinct host routes, half /32 in 10.0.0.0/16 and
+// half /128 in 2001:db8::/112. The trie gets deep nodes and many fringes.
+func randomHostRoutes(prng *rand.Rand, n int) []netip.Prefix {
+	set := make(map[netip.Prefix]bool, n)
+	pfxs := make([]netip.Prefix, 0, n)
+
+	for len(pfxs) < n {
+		a, b := byte(prng.UintN(256)), byte(prng.UintN(256))
+
+		ip := netip.AddrFrom4([4]byte{10, 0, a, b})
+		if len(pfxs)%2 == 1 {
+			ip = netip.AddrFrom16([16]byte{0x20, 0x01, 0x0d, 0xb8, 14: a, 15: b})
+		}
+
+		pfx := netip.PrefixFrom(ip, ip.BitLen())
+		if !set[pfx] {
+			set[pfx] = true
+			pfxs = append(pfxs, pfx)
+		}
+	}
+
+	return pfxs
 }

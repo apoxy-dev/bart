@@ -1675,6 +1675,285 @@ func (n *FastNode[V]) handleMatrixPersist(cloneFn func(V) V, thisExists bool, th
 	}
 }
 
+// DifferenceRecPersist removes from n all prefixes that are also in o, with
+// copy-on-write. It is the reverse of UnionRecPersist. The values in o are ignored.
+//
+// n must be a clone that the caller owns, at depth, and path holds the octets
+// above n. A child of n that loses prefixes is cloned once and is compressed
+// into n on return, one level at a time. Unlike PurgeAndCompress this also
+// removes a child that is now empty, which a batch delete can make.
+//
+// Returns the number of removed prefixes.
+func (n *FastNode[V]) DifferenceRecPersist(cloneFn func(V) V, o *FastNode[V], path StridePath, depth int, is4 bool) (deleted int) {
+	// the same index in both nodes is the same prefix
+	both := n.Prefixes.And(&o.Prefixes.BitSet256)
+	for idx := range both.All() {
+		n.DeletePrefix(idx)
+		deleted++
+	}
+
+	// a prefix of o below addr can only be below the same addr in n
+	for i, addr := range o.Children.AllEnumerate() {
+		thisChild, ok := n.GetChild(addr)
+		if !ok {
+			continue
+		}
+
+		path[depth&DepthMask] = addr
+		deleted += n.handleDifferenceMatrixPersist(cloneFn, thisChild, o.Children.Items[i], addr, path, depth, is4)
+	}
+
+	return deleted
+}
+
+// handleDifferenceMatrixPersist, 9 possible combinations to remove the prefixes
+// of other child from this child, the child of n at addr.
+//
+//	THIS,   OTHER:
+//	--------------
+//	node,   node    <-- same node: delete this node, else clone and rec-descent
+//	node,   leaf    <-- if this node holds the leaf prefix: clone and delete it
+//	node,   fringe  <-- if this node holds the default route: clone and delete it
+//
+//	leaf,   node    <-- if other node holds this leaf prefix: delete this leaf
+//	leaf,   leaf    <-- if same prefix: delete this leaf
+//	leaf,   fringe  <-- never the same prefix
+//
+//	fringe, node    <-- if other node holds the default route: delete this fringe
+//	fringe, leaf    <-- never the same prefix
+//	fringe, fringe  <-- same prefix: delete this fringe
+//
+// A cloned node is compressed into n after the delete.
+// Returns the number of removed prefixes.
+func (n *FastNode[V]) handleDifferenceMatrixPersist(cloneFn func(V) V, thisChild, otherChild any, addr uint8, path StridePath, depth int, is4 bool) int {
+	switch thisKid := thisChild.(type) {
+	case *FastNode[V]:
+		var kid *FastNode[V]
+
+		switch otherKid := otherChild.(type) {
+		case *FastNode[V]:
+			// both tables share this subtrie, all of it goes
+			if thisKid == otherKid {
+				s := thisKid.StatsRec()
+				n.DeleteChild(addr)
+				return s.Prefixes + s.Leaves + s.Fringes
+			}
+
+			// Cheap test before the clone: with no prefix index and no
+			// child addr in common, nothing below can match.
+			if !thisKid.Prefixes.Overlaps(&otherKid.Prefixes.BitSet256) &&
+				!thisKid.Children.Overlaps(&otherKid.Children.BitSet256) {
+				return 0
+			}
+
+			kid = thisKid.CloneFlat(cloneFn)
+			n.InsertChild(addr, kid)
+
+			deleted := kid.DifferenceRecPersist(cloneFn, otherKid, path, depth+1, is4)
+			if deleted == 0 {
+				// no match below, keep the old node and drop the clone
+				n.InsertChild(addr, thisKid)
+				return 0
+			}
+
+			n.compressChild(kid, addr, path, depth, is4)
+			return deleted
+
+		case *LeafNode[V]:
+			if !thisKid.hasPrefixAtDepth(otherKid.Prefix, depth+1) {
+				return 0
+			}
+
+			kid = thisKid.CloneFlat(cloneFn)
+			n.InsertChild(addr, kid)
+			kid.deletePersistAtDepth(cloneFn, otherKid.Prefix, path, depth+1, is4)
+
+		case *FringeNode[V]:
+			// the fringe of o is the default route of this node
+			if !thisKid.Prefixes.Test(1) {
+				return 0
+			}
+
+			kid = thisKid.CloneFlat(cloneFn)
+			n.InsertChild(addr, kid)
+			kid.DeletePrefix(1)
+
+		default:
+			panic("logic error, wrong node type")
+		}
+
+		n.compressChild(kid, addr, path, depth, is4)
+		return 1
+
+	case *LeafNode[V]:
+		switch otherKid := otherChild.(type) {
+		case *FastNode[V]:
+			if !otherKid.hasPrefixAtDepth(thisKid.Prefix, depth+1) {
+				return 0
+			}
+		case *LeafNode[V]:
+			if thisKid.Prefix != otherKid.Prefix {
+				return 0
+			}
+		case *FringeNode[V]:
+			return 0
+		default:
+			panic("logic error, wrong node type")
+		}
+
+		n.DeleteChild(addr)
+		return 1
+
+	case *FringeNode[V]:
+		switch otherKid := otherChild.(type) {
+		case *FastNode[V]:
+			if !otherKid.Prefixes.Test(1) {
+				return 0
+			}
+		case *LeafNode[V]:
+			return 0
+		case *FringeNode[V]:
+			// same prefix
+		default:
+			panic("logic error, wrong node type")
+		}
+
+		n.DeleteChild(addr)
+		return 1
+
+	default:
+		panic("logic error, wrong node type")
+	}
+}
+
+// hasPrefixAtDepth reports whether the subtrie of n holds pfx, n is at depth.
+// It is similar to Get, but starts at a node below the root.
+func (n *FastNode[V]) hasPrefixAtDepth(pfx netip.Prefix, depth int) bool {
+	pfxLen := pfx.Bits()
+	octets := pfx.Addr().AsSlice()
+	strideCount, modBits := DivMod8(pfxLen)
+
+	for ; depth < len(octets); depth++ {
+		octet := octets[depth]
+
+		if depth == strideCount {
+			return n.Prefixes.Test(art.PfxToIdx(octet, modBits))
+		}
+
+		kidAny, ok := n.GetChild(octet)
+		if !ok {
+			return false
+		}
+
+		switch kid := kidAny.(type) {
+		case *FastNode[V]:
+			n = kid // descend down to next trie level
+		case *FringeNode[V]:
+			return IsFringe(depth, pfxLen)
+		case *LeafNode[V]:
+			return kid.Prefix == pfx
+		default:
+			panic("logic error, wrong node type")
+		}
+	}
+
+	panic("unreachable")
+}
+
+// deletePersistAtDepth removes pfx from the subtrie of n with copy-on-write,
+// n is at depth and path holds the octets above n. n must be a clone that the
+// caller owns. Each node on the way down is cloned once, and is compressed
+// into its parent on the way back.
+//
+// Returns true if pfx existed.
+func (n *FastNode[V]) deletePersistAtDepth(cloneFn func(V) V, pfx netip.Prefix, path StridePath, depth int, is4 bool) (exists bool) {
+	pfxLen := pfx.Bits()
+	octets := pfx.Addr().AsSlice()
+	strideCount, modBits := DivMod8(pfxLen)
+	octet := octets[depth]
+
+	if depth == strideCount {
+		return n.DeletePrefix(art.PfxToIdx(octet, modBits))
+	}
+
+	kidAny, ok := n.GetChild(octet)
+	if !ok {
+		return false
+	}
+
+	switch kid := kidAny.(type) {
+	case *FastNode[V]:
+		kid = kid.CloneFlat(cloneFn)
+		n.InsertChild(octet, kid)
+
+		path[depth&DepthMask] = octet
+		if exists = kid.deletePersistAtDepth(cloneFn, pfx, path, depth+1, is4); exists {
+			n.compressChild(kid, octet, path, depth, is4)
+		}
+		return exists
+
+	case *FringeNode[V]:
+		if !IsFringe(depth, pfxLen) {
+			return false
+		}
+
+	case *LeafNode[V]:
+		if kid.Prefix != pfx {
+			return false
+		}
+
+	default:
+		panic("logic error, wrong node type")
+	}
+
+	n.DeleteChild(octet)
+	return true
+}
+
+// compressChild restores path compression for kid, the child of n at addr,
+// after kid lost prefixes. kid must be a clone that n owns, n is at depth and
+// path holds the octets above n.
+//
+// An empty kid is removed. A kid with a single prefix, leaf or fringe is
+// replaced in n by a leaf or fringe. This is one level of PurgeAndCompress.
+func (n *FastNode[V]) compressChild(kid *FastNode[V], addr uint8, path StridePath, depth int, is4 bool) {
+	pfxCount := kid.PrefixCount()
+	childCount := kid.ChildCount()
+
+	if pfxCount+childCount > 1 {
+		return
+	}
+
+	path[depth&DepthMask] = addr
+
+	switch {
+	case pfxCount == 0 && childCount == 0:
+		n.DeleteChild(addr)
+
+	case childCount == 1:
+		switch grandKid := kid.Children.Items[0].(type) {
+		case *FastNode[V]:
+			// a path node, the node stays as in PurgeAndCompress
+		case *LeafNode[V]:
+			n.DeleteChild(addr)
+			n.Insert(grandKid.Prefix, grandKid.Value, depth)
+		case *FringeNode[V]:
+			n.DeleteChild(addr)
+			fringeAddr, _ := kid.Children.FirstSet()
+			fringePfx := CidrForFringe(path[:depth+1], depth+1, is4, fringeAddr)
+			n.Insert(fringePfx, grandKid.Value, depth)
+		default:
+			panic("logic error, wrong node type")
+		}
+
+	default: // pfxCount == 1
+		n.DeleteChild(addr)
+		idx, _ := kid.Prefixes.FirstSet()
+		pfx := CidrFromPath(path, depth+1, is4, idx)
+		n.Insert(pfx, kid.MustGetPrefix(idx), depth)
+	}
+}
+
 // AllRec recursively traverses the trie starting at the current node,
 // applying the provided yield function to every stored prefix and value.
 //
